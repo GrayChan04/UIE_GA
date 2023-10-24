@@ -21,11 +21,13 @@ import torch
 from torch.utils.data import DataLoader
 from transformers import BertTokenizerFast
 
+# adding lr_scheduler part(cxl)
+from torch.optim import lr_scheduler
+
 from utils import IEDataset, logger, tqdm
 from model import UIE
 from evaluate import evaluate
 from utils import set_seed, SpanEvaluator, EarlyStopping, logging_redirect_tqdm
-
 
 def do_train():
 
@@ -46,8 +48,26 @@ def do_train():
     dev_data_loader = DataLoader(
         dev_ds, batch_size=args.batch_size, shuffle=True)
 
-    optimizer = torch.optim.AdamW(
-        lr=args.learning_rate, params=model.parameters())
+    # adding lr_scheduler part(cxl)
+    # get parameters(cxl)
+    not_linear_params = list(map(id, model.encoder.parameters()))
+    linear_params = filter(lambda p: id(p) not in not_linear_params, model.parameters())
+    
+    # original optimizer
+    #optimizer = torch.optim.AdamW(
+    #    lr=args.learning_rate, params=model.parameters())
+
+    # modified optimizer(cxl)
+    # might change to lion later(cxl)
+    encoder_optimizer = torch.optim.AdamW(params = model.encoder.parameters(), lr = args.learning_rate)
+    linear_optimizer = torch.optim.AdamW(params = linear_params, lr = args.learning_rate)
+    # create lr scheduler(cxl)
+    encoder_scheduler = lr_scheduler.CosineAnnealingLR(optimizer = encoder_optimizer, 
+                                                       T_max = 20, 
+                                                       eta_min = 0, 
+                                                       last_epoch = -1)
+    linear_scheduler = lr_scheduler.ReduceLROnPlateau(optimizer = linear_optimizer, 
+                                                      mode = "min")
 
     criterion = torch.nn.functional.binary_cross_entropy
     metric = SpanEvaluator()
@@ -106,8 +126,16 @@ def do_train():
             loss_end = criterion(end_prob, end_ids)
             loss = (loss_start + loss_end) / 2.0
             loss.backward()
-            optimizer.step()
-            optimizer.zero_grad()
+            # original optimizer
+            #optimizer.step()
+            #optimizer.zero_grad()
+
+            # modified optimizers(cxl)
+            linear_optimizer.step()
+            linear_optimizer.zero_grad()
+            encoder_optimizer.step()
+            encoder_optimizer.zero_grad()
+
             loss_list.append(float(loss))
             loss_sum += float(loss)
             loss_num += 1
@@ -184,6 +212,10 @@ def do_train():
                     model_to_save.save_pretrained(save_dir)
                     tokenizer.save_pretrained(save_dir)
                 tic_train = time.time()
+
+            # update schedulers(cxl)
+            encoder_scheduler.step()
+            linear_scheduler.step(loss)
 
         if args.early_stopping:
             dev_loss_avg, precision, recall, f1 = evaluate(
