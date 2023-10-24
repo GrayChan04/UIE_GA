@@ -446,7 +446,7 @@ class Logger(object):
     def __init__(self, name: str = None):
         name = 'UIE' if not name else name
         self.logger = logging.getLogger(name)
-
+        
         for key, conf in log_config.items():
             logging.addLevelName(conf['level'], key)
             self.__dict__[key] = functools.partial(
@@ -459,12 +459,18 @@ class Logger(object):
             log_colors={key: conf['color']
                         for key, conf in log_config.items()})
 
-        self.handler = logging.StreamHandler()
-        self.handler.setFormatter(self.format)
-
-        self.logger.addHandler(self.handler)
         self.logLevel = 'DEBUG'
+
+        self.handler = logging.StreamHandler()
         self.logger.setLevel(logging.DEBUG)
+        self.handler.setFormatter(self.format)
+        self.logger.addHandler(self.handler)
+
+        self.handler = logging.FileHandler("UIE_GA.log")
+        self.logger.setLevel(logging.DEBUG)
+        self.handler.setFormatter(self.format)
+        self.logger.addHandler(self.handler)
+
         self.logger.propagate = False
         self._is_enable = True
 
