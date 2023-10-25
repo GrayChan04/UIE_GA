@@ -21,32 +21,56 @@ import torch
 from torch.utils.data import DataLoader
 from transformers import BertTokenizerFast
 
-# adding lr_scheduler part(cxl)
-from torch.optim import lr_scheduler
-
 from utils import IEDataset, logger, tqdm
 from model import UIE
 from evaluate import evaluate
 from utils import set_seed, SpanEvaluator, EarlyStopping, logging_redirect_tqdm
 
+# adding ddp part
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
+from torch.utils.data.distributed import DistributedSampler
+
+# adding lr_scheduler part(cxl)
+from torch.optim import lr_scheduler
+
 def do_train():
 
     set_seed(args.seed)
     show_bar = True
+    
+    # adding DDP initialization(whj)
+    if args.device == 'gpu':
+        args.local_rank=int(os.environ["LOCAL_RANK"])
+        torch.cuda.set_device(args.local_rank)
+        dist.init_process_group(backend='nccl', 
+                                world_size=torch.cuda.device_count(), 
+                                rank=args.local_rank)
 
     tokenizer = BertTokenizerFast.from_pretrained(args.model)
     model = UIE.from_pretrained(args.model)
+    
+    # original gpu
+    # if args.device == 'gpu':
+    #     model = model.cuda()
+    # adding DDP model(whj)
     if args.device == 'gpu':
-        model = model.cuda()
+        model = model.to(args.local_rank)
+        model = DistributedDataParallel(model, device_ids=[args.local_rank], output_device=args.local_rank, find_unused_parameters=True)
+
     train_ds = IEDataset(args.train_path, tokenizer=tokenizer,
                          max_seq_len=args.max_seq_len)
     dev_ds = IEDataset(args.dev_path, tokenizer=tokenizer,
                        max_seq_len=args.max_seq_len)
+    
+    # adding DDP dataloader(whj)
+    train_sampler = DistributedSampler(train_ds)
+    dev_sampler = DistributedSampler(dev_ds)
 
     train_data_loader = DataLoader(
-        train_ds, batch_size=args.batch_size, shuffle=True)
+        train_ds, batch_size=args.batch_size, sampler=train_sampler)
     dev_data_loader = DataLoader(
-        dev_ds, batch_size=args.batch_size, shuffle=True)
+        dev_ds, batch_size=args.batch_size, sampler=dev_sampler)
 
     # adding lr_scheduler part(cxl)
     # get parameters(cxl)
@@ -61,6 +85,7 @@ def do_train():
     # might change to lion later(cxl)
     encoder_optimizer = torch.optim.AdamW(params = model.encoder.parameters(), lr = args.learning_rate)
     linear_optimizer = torch.optim.AdamW(params = linear_params, lr = args.learning_rate)
+
     # create lr scheduler(cxl)
     encoder_scheduler = lr_scheduler.CosineAnnealingLR(optimizer = encoder_optimizer, 
                                                        T_max = 20, 
@@ -95,26 +120,37 @@ def do_train():
     best_f1 = 0
     tic_train = time.time()
     epoch_iterator = range(1, args.num_epochs + 1)
-    if show_bar:
+    if show_bar :
         train_postfix_info = {'loss': 'unknown'}
         epoch_iterator = tqdm(
             epoch_iterator, desc='Training', unit='epoch')
     for epoch in epoch_iterator:
         train_data_iterator = train_data_loader
-        if show_bar:
+        if show_bar :
             train_data_iterator = tqdm(train_data_iterator,
                                        desc=f'Training Epoch {epoch}', unit='batch')
             train_data_iterator.set_postfix(train_postfix_info)
         for batch in train_data_iterator:
-            if show_bar:
+            if show_bar  and torch.distributed.get_rank() == 0:
                 epoch_iterator.refresh()
             input_ids, token_type_ids, att_mask, start_ids, end_ids = batch
+
+            # original gpu
+            # if args.device == 'gpu':
+            #     input_ids = input_ids.cuda()
+            #     token_type_ids = token_type_ids.cuda()
+            #     att_mask = att_mask.cuda()
+            #     start_ids = start_ids.cuda()
+            #     end_ids = end_ids.cuda()
+
+            # adding device setup(whj)
             if args.device == 'gpu':
-                input_ids = input_ids.cuda()
-                token_type_ids = token_type_ids.cuda()
-                att_mask = att_mask.cuda()
-                start_ids = start_ids.cuda()
-                end_ids = end_ids.cuda()
+                input_ids = input_ids.to(args.local_rank)
+                token_type_ids = token_type_ids.to(args.local_rank)
+                att_mask = att_mask.to(args.local_rank)
+                start_ids = start_ids.to(args.local_rank)
+                end_ids = end_ids.to(args.local_rank)
+
             outputs = model(input_ids=input_ids,
                             token_type_ids=token_type_ids,
                             attention_mask=att_mask)
@@ -126,6 +162,7 @@ def do_train():
             loss_end = criterion(end_prob, end_ids)
             loss = (loss_start + loss_end) / 2.0
             loss.backward()
+
             # original optimizer
             #optimizer.step()
             #optimizer.zero_grad()
@@ -140,7 +177,8 @@ def do_train():
             loss_sum += float(loss)
             loss_num += 1
 
-            if show_bar:
+            # select cuda output(whj)
+            if show_bar and torch.distributed.get_rank() == 0:
                 loss_avg = loss_sum / loss_num
                 train_postfix_info.update({
                     'loss': f'{loss_avg:.5f}'
@@ -148,7 +186,8 @@ def do_train():
                 train_data_iterator.set_postfix(train_postfix_info)
 
             global_step += 1
-            if global_step % args.logging_steps == 0:
+            # select cuda output(whj)
+            if global_step % args.logging_steps == 0 and torch.distributed.get_rank() == 0:
                 time_diff = time.time() - tic_train
                 loss_avg = loss_sum / loss_num
 
@@ -165,12 +204,13 @@ def do_train():
                            args.logging_steps / time_diff))
                 tic_train = time.time()
 
-            if global_step % args.valid_steps == 0:
+            # select cuda output(whj)
+            if global_step % args.valid_steps == 0 and torch.distributed.get_rank() == 0:
                 save_dir = os.path.join(
                     args.save_dir, "model_%d" % global_step)
                 if not os.path.exists(save_dir):
                     os.makedirs(save_dir)
-                model_to_save = model
+                model_to_save = model.module if hasattr(model, 'module') else model
                 model_to_save.save_pretrained(save_dir)
                 tokenizer.save_pretrained(save_dir)
                 if args.max_model_num:
@@ -179,9 +219,14 @@ def do_train():
                         args.save_dir, "model_%d" % model_to_delete)
                     if model_to_delete > 0 and os.path.exists(model_to_delete_path):
                         shutil.rmtree(model_to_delete_path)
-
+                        
+                # original evaluate
+                # dev_loss_avg, precision, recall, f1 = evaluate(
+                #     model, metric, data_loader=dev_data_loader, device=args.device, loss_fn=criterion)
+                
+                # adding evaluate DDP(whj)
                 dev_loss_avg, precision, recall, f1 = evaluate(
-                    model, metric, data_loader=dev_data_loader, device=args.device, loss_fn=criterion)
+                    model, metric, data_loader=dev_data_loader, device=args.device, local_rank=args.local_rank, loss_fn=criterion)
 
                 if show_bar:
                     train_postfix_info.update({
@@ -208,7 +253,7 @@ def do_train():
                         )
                     best_f1 = f1
                     save_dir = os.path.join(args.save_dir, "model_best")
-                    model_to_save = model
+                    model_to_save = model.module if hasattr(model, 'module') else model
                     model_to_save.save_pretrained(save_dir)
                     tokenizer.save_pretrained(save_dir)
                 tic_train = time.time()
@@ -217,9 +262,15 @@ def do_train():
             encoder_scheduler.step()
             linear_scheduler.step(loss)
 
-        if args.early_stopping:
+        if args.early_stopping and torch.distributed.get_rank() == 0:
+
+            # original evaluate
+            # dev_loss_avg, precision, recall, f1 = evaluate(
+            #     model, metric, data_loader=dev_data_loader, device=args.device, loss_fn=criterion)
+            
+            # adding evaluate DDP(whj)
             dev_loss_avg, precision, recall, f1 = evaluate(
-                model, metric, data_loader=dev_data_loader, device=args.device, loss_fn=criterion)
+                model, metric, data_loader=dev_data_loader, device=args.device, local_rank=args.local_rank, loss_fn=criterion)
 
             if show_bar:
                 train_postfix_info.update({
@@ -278,6 +329,9 @@ if __name__ == "__main__":
                         help="Max number of saved model. Best model and earlystopping model is not included.")
     parser.add_argument("--early_stopping", action='store_true', default=False,
                         help="Use early stopping while training")
+    #adding ddp argument(whj)
+    parser.add_argument('--local_rank', default=-1, type=int, 
+                        help="node rank for distributed training")
 
     args = parser.parse_args()
     # yapf: enable
