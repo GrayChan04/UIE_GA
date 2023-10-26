@@ -20,11 +20,19 @@ import torch
 from transformers import BertTokenizerFast
 from torch.utils.data import DataLoader
 
+# adding DDP part
+import os
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
+from torch.utils.data.distributed import DistributedSampler
+
 from utils import IEMapDataset, SpanEvaluator, IEDataset, convert_example, get_relation_type_dict, logger, tqdm, unify_prompt_name
 
-
 @torch.no_grad()
-def evaluate(model, metric, data_loader, device='gpu', loss_fn=None, show_bar=True):
+# origianl evaluate
+# def evaluate(model, metric, data_loader, device='gpu', loss_fn=None, show_bar=True):
+# DDP evaluate(whj)
+def evaluate(model, metric, data_loader, device='gpu', local_rank=-1, loss_fn=None, show_bar=True):
     """
     Given a dataset, it evals model and computes the metric.
     Args:
@@ -45,10 +53,19 @@ def evaluate(model, metric, data_loader, device='gpu', loss_fn=None, show_bar=Tr
             data_loader, desc="Evaluating", unit='batch')
     for batch in data_loader:
         input_ids, token_type_ids, att_mask, start_ids, end_ids = batch
+        
+        # original gpu
+        # if device == 'gpu':
+        #     input_ids = input_ids.cuda()
+        #     token_type_ids = token_type_ids.cuda()
+        #     att_mask = att_mask.cuda()
+
+        # adding DDP device setup (whj)
         if device == 'gpu':
-            input_ids = input_ids.cuda()
-            token_type_ids = token_type_ids.cuda()
-            att_mask = att_mask.cuda()
+            input_ids = input_ids.to(local_rank)
+            token_type_ids = token_type_ids.to(local_rank)
+            att_mask = att_mask.to(local_rank)
+
         outputs = model(input_ids=input_ids,
                         token_type_ids=token_type_ids,
                         attention_mask=att_mask)
@@ -77,6 +94,7 @@ def evaluate(model, metric, data_loader, device='gpu', loss_fn=None, show_bar=Tr
         # Calcalate metric
         num_correct, num_infer, num_label = metric.compute(start_prob, end_prob,
                                                            start_ids, end_ids)
+
         metric.update(num_correct, num_infer, num_label)
     precision, recall, f1 = metric.accumulate()
     model.train()
@@ -86,18 +104,41 @@ def evaluate(model, metric, data_loader, device='gpu', loss_fn=None, show_bar=Tr
     else:
         return precision, recall, f1
 
-
 def do_eval():
+
     tokenizer = BertTokenizerFast.from_pretrained(args.model_path)
     model = UIE.from_pretrained(args.model_path)
-    if args.device == 'gpu':
-        model = model.cuda()
 
+    # original gpu
+    # if args.device == 'gpu':
+    #     model = model.cuda()
+
+    # adding DDP part(whj)
+    if args.device == 'gpu':
+        # adding DDP initializaton(whj)
+        args.local_rank=int(os.environ["LOCAL_RANK"])
+        torch.cuda.set_device(args.local_rank)
+        dist.init_process_group(
+            backend='nccl',
+            world_size=torch.cuda.device_count(),
+            rank=args.local_rank
+        )
+        # adding DDP model(whj)
+        model = model.to(args.local_rank)
+        model = DistributedDataParallel(model, device_ids=[args.local_rank], output_device=args.local_rank, find_unused_parameters=True)
+        
     test_ds = IEDataset(args.test_path, tokenizer=tokenizer,
                         max_seq_len=args.max_seq_len)
-
+    
+    # origianl dataloader
+    # test_data_loader = DataLoader(
+    #     test_ds, batch_size=args.batch_size, shuffle=False)
+    
+    # adding DDP dataloader(whj)
+    test_sampler = DistributedSampler(test_ds)
     test_data_loader = DataLoader(
-        test_ds, batch_size=args.batch_size, shuffle=False)
+        test_ds, batch_size=args.batch_size, sampler=test_sampler)
+
     class_dict = {}
     relation_data = []
     if args.debug:
@@ -119,12 +160,24 @@ def do_eval():
                                    max_seq_len=args.max_seq_len)
         else:
             test_ds = class_dict[key]
+        
+        # origianl dataloader
+        # test_data_loader = DataLoader(
+        #     test_ds, batch_size=args.batch_size, shuffle=False)
 
+        # adding DDP dataloader(whj)
         test_data_loader = DataLoader(
-            test_ds, batch_size=args.batch_size, shuffle=False)
+            test_ds, batch_size=args.batch_size, sampler=test_sampler)
+        
         metric = SpanEvaluator()
+
+        # original evaluate
+        # precision, recall, f1 = evaluate(
+        #     model, metric, test_data_loader, args.device)
+        
+        # DDP evaluate (whj)
         precision, recall, f1 = evaluate(
-            model, metric, test_data_loader, args.device)
+            model, metric, test_data_loader, args.device, args.local_rank)
         logger.info("-----------------------------")
         logger.info("Class Name: %s" % key)
         logger.info("Evaluation Precision: %.5f | Recall: %.5f | F1: %.5f" %
@@ -134,12 +187,24 @@ def do_eval():
         for key in relation_type_dict.keys():
             test_ds = IEMapDataset(relation_type_dict[key], tokenizer=tokenizer,
                                    max_seq_len=args.max_seq_len)
+            # original dataloader
+            # test_data_loader = DataLoader(
+            #     test_ds, batch_size=args.batch_size, shuffle=False)
 
+            # DDP dataloader(whj)
             test_data_loader = DataLoader(
-                test_ds, batch_size=args.batch_size, shuffle=False)
+                test_ds, batch_size=args.batch_size, sampler=test_sampler)
+            
             metric = SpanEvaluator()
+
+            # origianl evaluate
+            # precision, recall, f1 = evaluate(
+            #     model, metric, test_data_loader, args.device)
+
+            # DDP evaluate(whj)
             precision, recall, f1 = evaluate(
-                model, metric, test_data_loader, args.device)
+                model, metric, test_data_loader, args.device, args.local_rank)
+            
             logger.info("-----------------------------")
             logger.info("Class Name: X的%s" % key)
             logger.info("Evaluation Precision: %.5f | Recall: %.5f | F1: %.5f" %
@@ -162,6 +227,9 @@ if __name__ == "__main__":
                         help="Select which device to run model, defaults to gpu.")
     parser.add_argument("--debug", action='store_true',
                         help="Precision, recall and F1 score are calculated for each class separately if this option is enabled.")
+    #adding ddp argument(whj)
+    parser.add_argument('--local_rank', default=-1, type=int, 
+                        help="node rank for distributed training")
 
     args = parser.parse_args()
     # yapf: enable
