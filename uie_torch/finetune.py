@@ -143,7 +143,7 @@ def do_train():
             #     start_ids = start_ids.cuda()
             #     end_ids = end_ids.cuda()
 
-            # adding device setup(whj)
+            # adding DDP device setup(whj)
             if args.device == 'gpu':
                 input_ids = input_ids.to(args.local_rank)
                 token_type_ids = token_type_ids.to(args.local_rank)
