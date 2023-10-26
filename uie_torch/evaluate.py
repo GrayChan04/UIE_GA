@@ -28,7 +28,6 @@ from torch.utils.data.distributed import DistributedSampler
 
 from utils import IEMapDataset, SpanEvaluator, IEDataset, convert_example, get_relation_type_dict, logger, tqdm, unify_prompt_name
 
-
 @torch.no_grad()
 # origianl evaluate
 # def evaluate(model, metric, data_loader, device='gpu', loss_fn=None, show_bar=True):
@@ -105,7 +104,6 @@ def evaluate(model, metric, data_loader, device='gpu', local_rank=-1, loss_fn=No
     else:
         return precision, recall, f1
 
-
 def do_eval():
 
     tokenizer = BertTokenizerFast.from_pretrained(args.model_path)
@@ -128,7 +126,6 @@ def do_eval():
         # adding DDP model(whj)
         model = model.to(args.local_rank)
         model = DistributedDataParallel(model, device_ids=[args.local_rank], output_device=args.local_rank, find_unused_parameters=True)
-
         
     test_ds = IEDataset(args.test_path, tokenizer=tokenizer,
                         max_seq_len=args.max_seq_len)
