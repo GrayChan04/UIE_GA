@@ -33,6 +33,7 @@ from torch.utils.data.distributed import DistributedSampler
 
 # adding lr_scheduler part(cxl)
 from torch.optim import lr_scheduler
+from math import cos, pi
 
 def do_train():
 
@@ -83,17 +84,23 @@ def do_train():
 
     # modified optimizer(cxl)
     # might change to lion later(cxl)
-    encoder_optimizer = torch.optim.AdamW(params = model.encoder.parameters(), lr = args.learning_rate)
-    linear_optimizer = torch.optim.AdamW(params = linear_params, lr = args.learning_rate)
+    optimizer = torch.optim.AdamW(params = [{"params": model.encoder.parameters()}, {"params": linear_params}], lr = args.learning_rate)
 
-    # create lr scheduler(cxl)
-    encoder_scheduler = lr_scheduler.CosineAnnealingLR(optimizer = encoder_optimizer, 
-                                                       T_max = 20, 
-                                                       eta_min = 0, 
-                                                       last_epoch = -1)
-    linear_scheduler = lr_scheduler.ReduceLROnPlateau(optimizer = linear_optimizer, 
-                                                      mode = "min")
-
+    # warm up set(cxl)
+    warm_up_step = 250 # when to flop
+    # CosineAnnealingLR for encoder(cxl)
+    lr_min = 0
+    lr_max = 1e-5
+    T_max = args.num_epochs
+    lambda_encoder = lambda step: step / warm_up_step if step < warm_up_step else \
+                                    (lr_min + 0.5 * (lr_max - lr_min) * cos((step - warm_up_step) / (T_max - warm_up_step) * pi)) / args.learning_rate
+    # ExponentialLR for linear
+    gamma = 0.95
+    lambda_linear = lambda step: step / warm_up_step if step < warm_up_step else \
+                                    gamma**step
+                  
+    scheduler = lr_scheduler.LambdaLR(optimizer = optimizer, lr_lambda = [lambda_encoder, lambda_linear])
+    
     criterion = torch.nn.functional.binary_cross_entropy
     metric = SpanEvaluator()
 
@@ -162,17 +169,12 @@ def do_train():
             loss_end = criterion(end_prob, end_ids)
             loss = (loss_start + loss_end) / 2.0
             loss.backward()
-
-            # original optimizer
-            #optimizer.step()
-            #optimizer.zero_grad()
-
-            # modified optimizers(cxl)
-            linear_optimizer.step()
-            linear_optimizer.zero_grad()
-            encoder_optimizer.step()
-            encoder_optimizer.zero_grad()
-
+            optimizer.step()
+            optimizer.zero_grad()
+            
+            # adding scheduler(cxl)
+            scheduler.step()
+            
             loss_list.append(float(loss))
             loss_sum += float(loss)
             loss_num += 1
@@ -194,13 +196,13 @@ def do_train():
                 if show_bar:
                     with logging_redirect_tqdm([logger.logger]):
                         logger.info(
-                            "global step %d, epoch: %d, loss: %.5f, speed: %.2f step/s"
-                            % (global_step, epoch, loss_avg,
+                            "global step %d, learning_rate: %s, epoch: %d, loss: %.5f, speed: %.2f step/s"# adding logging lr(cxl)
+                            % (global_step, scheduler.get_last_lr(), epoch, loss_avg,
                                args.logging_steps / time_diff))
                 else:
                     logger.info(
-                        "global step %d, epoch: %d, loss: %.5f, speed: %.2f step/s"
-                        % (global_step, epoch, loss_avg,
+                        "global step %d, learning_rate: %s, epoch: %d, loss: %.5f, speed: %.2f step/s"# adding logging lr(cxl)
+                        % (global_step, scheduler.get_last_lr(), epoch, loss_avg, 
                            args.logging_steps / time_diff))
                 tic_train = time.time()
 
@@ -257,10 +259,6 @@ def do_train():
                     model_to_save.save_pretrained(save_dir)
                     tokenizer.save_pretrained(save_dir)
                 tic_train = time.time()
-
-            # update schedulers(cxl)
-            encoder_scheduler.step()
-            linear_scheduler.step(loss)
 
         if args.early_stopping and torch.distributed.get_rank() == 0:
 
