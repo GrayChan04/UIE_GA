@@ -56,7 +56,8 @@ def convert_np_float32(obj):
 
 app = Flask(__name__)
 @app.route('/uie', methods=[ "GET"])
-def universalEntityExtract():
+# original UIE
+def universalInformationExtract():
     if request.method == 'GET':
         data = request.get_json()
         text = data['text']
@@ -72,6 +73,32 @@ def universalEntityExtract():
         result = json.dumps(convert_np_float32(uie_dict), ensure_ascii=False)
         print(result)
     return result
+    
+# modified UIE(cxl, whj)
+def universalInformationExtract():
+    while(1):
+        text_list = []
+        id_list = [] # assume request id for identification
+        while(len(text_list) != 16): # batch_size = 16
+            if request.method == 'GET':
+                data = request.get_json()
+                text_list.append(data['text'])
+                id_list.append(data['id'])
+        uie_result = model_func(text_list)
+        # # float32类型的数据无法进行JSON序列化，转成float
+        # for entity_type in uie_result:
+        #     for entity in entity_type.values():
+        #         for item in entity:
+        #             if 'probability' in item:
+        #                 item['probability'] = float(item['probability'])
+        response_list = []
+        for i in range(16):
+            dic_temp={'id': id[i], 'result': uie_result[i]}
+            response = json.dumps(convert_np_float32(dic_temp), ensure_ascii=False)
+            response_list.append(response)
+        
+        print(response_list)
+return response_list
 
 if __name__ == '__main__':
     app.run('0.0.0.0', port=6020)
